@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Env / secrets (none currently, guard for future)
+.env
+.env.*
+
+# Editor
+.vscode/
+.idea/
