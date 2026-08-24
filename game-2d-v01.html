@@ -1,0 +1,1040 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>重力失控的城市</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    overflow: hidden; background: #120a24;
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  #game { position: fixed; inset: 0; display: block; touch-action: none; }
+
+  /* ---------- 稳定度条 ---------- */
+  #hud {
+    position: fixed; top: calc(14px + env(safe-area-inset-top)); left: 50%;
+    transform: translateX(-50%); width: min(300px, 62vw);
+    pointer-events: none; z-index: 5;
+  }
+  #stabWrap {
+    height: 10px; border-radius: 6px; background: rgba(255,255,255,.14);
+    box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset, 0 2px 8px rgba(0,0,0,.35);
+    overflow: hidden;
+  }
+  #stabFill { height: 100%; width: 100%; border-radius: 6px; transition: width .12s linear; }
+  #hudText {
+    margin-top: 5px; text-align: center; font-size: 11px;
+    letter-spacing: 2px; color: rgba(255,255,255,.55);
+  }
+  #hud.low #stabFill { animation: pulse .5s infinite alternate; }
+  @keyframes pulse { from { filter: brightness(1); } to { filter: brightness(1.8); } }
+
+  /* ---------- 结局遮罩 ---------- */
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: rgba(8,5,18,.55); backdrop-filter: blur(6px);
+    z-index: 10; opacity: 0; pointer-events: none; transition: opacity .6s;
+  }
+  #overlay.show { opacity: 1; pointer-events: auto; }
+  #endTitle {
+    font-size: 34px; color: #ffe9c4; letter-spacing: 8px; margin: 0 0 10px;
+    text-shadow: 0 0 24px rgba(255,180,90,.5); font-weight: 600;
+  }
+  #endSub { font-size: 13px; color: rgba(255,255,255,.6); letter-spacing: 2px; margin: 0 0 34px; }
+  #restartBtn {
+    cursor: pointer; border: 1px solid rgba(255,210,140,.6);
+    background: rgba(255,180,90,.12); color: #ffd9a0;
+    font-size: 16px; letter-spacing: 4px; padding: 13px 42px; border-radius: 999px;
+    transition: all .2s;
+  }
+  #restartBtn:active { transform: scale(.94); background: rgba(255,180,90,.3); }
+
+  /* ---------- Debug 面板 ---------- */
+  #debug {
+    position: fixed; top: calc(60px + env(safe-area-inset-top)); right: 10px; z-index: 20;
+    display: none; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.2);
+    border-radius: 8px; padding: 8px; font-size: 11px;
+  }
+  #debug button {
+    display: block; width: 100%; margin: 4px 0; font-size: 11px;
+    padding: 6px 8px; cursor: pointer; border-radius: 4px;
+    border: 1px solid #666; background: #222; color: #eee;
+  }
+  #debugInfo { white-space: pre; color: #8fd; margin-top: 4px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud">
+  <div id="stabWrap"><div id="stabFill"></div></div>
+  <div id="hudText">稳定度</div>
+</div>
+
+<div id="overlay">
+  <h1 id="endTitle"></h1>
+  <p id="endSub"></p>
+  <button id="restartBtn">↻ 再来一次</button>
+</div>
+
+<div id="debug">
+  <button id="dbgFall">触发坠落</button>
+  <button id="dbgWin">触发完成</button>
+  <button id="dbgReset">重置</button>
+  <div id="debugInfo"></div>
+</div>
+
+<script>
+'use strict';
+/* =====================================================================
+ * 重力失控的城市 · V0.1
+ * 单文件 Canvas 2D 小游戏，零依赖，双击即可运行。
+ *
+ * 代码结构（自上而下）：
+ *   1. 配置常量        —— 所有可调参数集中在这里
+ *   2. 工具函数        —— 随机数 / 插值 / 颜色
+ *   3. 画布与适配      —— 9:16 逻辑舞台，桌面居中
+ *   4. 游戏状态        —— freshState() 一个对象装全部状态
+ *   5. 世界生成        —— 程序化生成城市 / 车 / 碎片 / 云 / 星
+ *   6. 输入            —— Pointer Events 统一触摸与鼠标
+ *   7. 更新逻辑        —— 重力 / 旋转 / 稳定度 / 车辆 / 粒子 / 结局
+ *   8. 渲染            —— 天空 / 城市 / 太阳 / 特效
+ *   9. HUD 与流程      —— 稳定度条 / 结局遮罩 / 重开
+ *  10. Debug 与主循环
+ * ===================================================================== */
+
+/* ==================== 1. 配置常量 ==================== */
+const LW = 540, LH = 960;            // 逻辑舞台尺寸（9:16）
+const ROUND_TIME = 20;               // 单局时长（秒）
+const PIVOT = { x: 270, y: 430 };    // 城市旋转中心
+const SUN_HOME = { x: 270, y: 790 }; // 太阳默认位置（城市正下方）
+const GRAV_REF = 320;                // 太阳距中心多远时重力达到满强度
+const DRAIN_RATE = 11;               // 满倾侧时稳定度每秒下降量
+const RECOVER_RATE = 5.5;            // 平缓时稳定度每秒恢复量
+
+/* ==================== 2. 工具函数 ==================== */
+// 种子随机数：同一 seed 生成同一座城市，方便录屏复现
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, k) => a + (b - a) * k;
+const TAU = Math.PI * 2;
+// 角度差（处理 ±π 回绕）
+function angDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= TAU;
+  while (d < -Math.PI) d += TAU;
+  return d;
+}
+function mixRGB(a, b, k) {
+  return [Math.round(lerp(a[0], b[0], k)), Math.round(lerp(a[1], b[1], k)), Math.round(lerp(a[2], b[2], k))];
+}
+const rgb = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+
+/* ==================== 3. 画布与适配 ==================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let DPR = 1, scale = 1, ox = 0, oy = 0, cw = 0, ch = 0;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  cw = window.innerWidth; ch = window.innerHeight;
+  canvas.width = cw * DPR; canvas.height = ch * DPR;
+  canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+  // 9:16 逻辑舞台：竖屏铺满，桌面居中（两侧露出天空渐变，属预期效果）
+  scale = Math.min(cw / LW, ch / LH);
+  ox = (cw - LW * scale) / 2;
+  oy = (ch - LH * scale) / 2;
+}
+window.addEventListener('resize', resize);
+
+/* ==================== 4. 游戏状态 ==================== */
+let G = null;   // 全部游戏状态都挂在这个对象上，重开时整体换新
+
+function freshState(seed) {
+  return {
+    seed,
+    state: 'play',            // play | fall | balance | result
+    t: 0,                     // 全局时间（驱动闪烁、脉动等）
+    time: 0,                  // 本局已进行时间
+    stability: 100,           // 稳定度 0-100
+    theta: 0, thetaV: 0, thetaT: 0,   // 城市当前角度 / 角速度 / 目标角度
+    g: { x: 0, y: 1 }, gMag: 0.6,     // 重力方向（单位向量）与强度
+    severity: 0, sevSmooth: 0,        // 失控程度（瞬间值 / 平滑值）
+    sun: { x: SUN_HOME.x, y: SUN_HOME.y, vx: 0, vy: 0, grabbed: false },
+    hasInteracted: false,     // 首次拖动后隐藏新手引导
+    camRot: 0, camY: 0, shake: 0,     // 镜头旋转 / 纵向跟随 / 抖动
+    cityY: 0, cityVy: 0,      // 坠落结局中城市的下落位移与速度
+    fallT: 0, balT: 0, fade: 0,       // 结局计时与渐黑
+    endKind: null,
+    world: null,
+  };
+}
+
+/* ==================== 5. 世界生成 ==================== */
+function makeRockVerts(R, n) {
+  const v = [];
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU, r = 0.6 + R() * 0.5;
+    v.push([Math.cos(a) * r, Math.sin(a) * r]);
+  }
+  return v;
+}
+
+function buildWorld(seed) {
+  const R = mulberry32(seed);
+  const world = {};
+
+  // --- 建筑：一排高低错落的剪影楼 ---
+  world.buildings = [];
+  let x = -178;
+  while (x < 150) {
+    const w = 26 + R() * 30;
+    const h = 55 + R() * 135;
+    const cols = Math.max(2, Math.floor(w / 9));
+    const rows = Math.max(3, Math.floor(h / 13));
+    const lit = [];
+    for (let i = 0; i < cols * rows; i++) lit.push(R() < 0.45 ? 1 : 0);
+    world.buildings.push({ x, w, h, cols, rows, lit });
+    x += w + 4 + R() * 10;
+  }
+
+  // --- 岛底岩石（锯齿轮廓用） ---
+  world.rocks = [];
+  for (let i = 0; i < 14; i++) {
+    world.rocks.push({ lx: -180 + i * 27 + R() * 10, ly: 8 + R() * 16, depth: 30 + R() * 70 });
+  }
+
+  // --- 车辆：在顶层街道巡航，可随坡度滑动 ---
+  const carColors = [[255,200,90],[240,120,90],[140,200,255],[190,160,255],[255,150,150],[150,230,170]];
+  world.cars = [];
+  for (let i = 0; i < 6; i++) {
+    world.cars.push({
+      s: -150 + i * 56 + R() * 18,          // 街道坐标（城市局部 x）
+      v: (R() < 0.5 ? -1 : 1) * (10 + R() * 14),
+      dir: R() < 0.5 ? -1 : 1,              // 巡航方向
+      color: carColors[i % carColors.length],
+      detached: false,                      // 是否已被甩出城市
+      x: 0, y: 0, vx: 0, vy: 0, rot: 0, rotV: 0,
+    });
+  }
+
+  // --- 城市周围漂浮的碎片 ---
+  world.debris = [];
+  for (let i = 0; i < 22; i++) {
+    const ang = R() * TAU, dist = 210 + R() * 90;
+    const lx = Math.cos(ang) * dist, ly = Math.sin(ang) * dist * 0.7 - 30;
+    world.debris.push({
+      lx, ly, x: PIVOT.x + lx, y: PIVOT.y + ly, vx: 0, vy: 0,
+      size: 2.5 + R() * 5, rot: R() * TAU, rotV: (R() - 0.5) * 1.5,
+      verts: makeRockVerts(R, 5 + ((R() * 3) | 0)),
+    });
+  }
+
+  // --- 流动云层 ---
+  world.clouds = [];
+  for (let i = 0; i < 9; i++) {
+    world.clouds.push({ x: R() * LW, y: 80 + R() * 620, sc: 0.5 + R() * 1.1, sp: 4 + R() * 10, a: 0.05 + R() * 0.09 });
+  }
+
+  // --- 星星 ---
+  world.stars = [];
+  for (let i = 0; i < 80; i++) {
+    world.stars.push({ x: R() * LW, y: R() * LH, r: 0.5 + R() * 1.3, ph: R() * TAU, tw: 1 + R() * 3 });
+  }
+
+  // --- 粒子容器（瀑布 / 金色 / 飞鸟） ---
+  world.drops = [];
+  world.gold = [];
+  world.birds = [];
+  world.emitAcc = 0;
+  return world;
+}
+
+// 城市局部坐标 → 世界坐标（考虑城市旋转与坠落位移）
+function cityToWorld(lx, ly) {
+  const c = Math.cos(G.theta), s = Math.sin(G.theta);
+  return { x: PIVOT.x + lx * c - ly * s, y: PIVOT.y + G.cityY + lx * s + ly * c };
+}
+
+/* ==================== 6. 输入 ==================== */
+const pointer = { x: 0, y: 0, down: false };
+
+function toLogical(e) {
+  return { x: (e.clientX - ox) / scale, y: (e.clientY - oy) / scale };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const p = toLogical(e);
+  pointer.x = p.x; pointer.y = p.y; pointer.down = true;
+  if (G.state !== 'play') return;
+  const dx = p.x - G.sun.x, dy = p.y - G.sun.y;
+  if (dx * dx + dy * dy < 80 * 80) {   // 宽松的抓取半径，手机上好按
+    G.sun.grabbed = true;
+    G.hasInteracted = true;
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  const p = toLogical(e);
+  pointer.x = p.x; pointer.y = p.y;
+});
+function releasePointer() {
+  pointer.down = false;
+  if (G) G.sun.grabbed = false;
+}
+canvas.addEventListener('pointerup', releasePointer);
+canvas.addEventListener('pointercancel', releasePointer);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+
+/* ==================== 7. 更新逻辑 ==================== */
+function update(dt) {
+  G.t += dt;
+  const W = G.world;
+
+  // 云层在任何状态下都流动（结局画面也保持生动）
+  for (const c of W.clouds) {
+    c.x += c.sp * dt * (1 + G.sevSmooth * 2);
+    if (c.x > LW + 140) c.x = -140;
+  }
+
+  if (G.state === 'play') updatePlay(dt);
+  else if (G.state === 'fall') updateFall(dt);
+  else if (G.state === 'balance') updateBalance(dt);
+
+  updateDrops(dt);
+  updateGold(dt);
+  updateBirds(dt);
+  updateDebris(dt);
+  updateCamera(dt);
+
+  // 窗户随机亮灭
+  for (const b of W.buildings) {
+    if (Math.random() < dt * 2.2) {
+      const i = (Math.random() * b.lit.length) | 0;
+      b.lit[i] ^= 1;
+    }
+  }
+}
+
+// ---------- 游玩中 ----------
+function updatePlay(dt) {
+  G.time += dt;
+  const sun = G.sun;
+
+  // 太阳：抓住时跟手，松手后弹簧回位
+  if (sun.grabbed) {
+    const tx = clamp(pointer.x, 20, LW - 20);
+    const ty = clamp(pointer.y, 20, LH - 20);
+    const k = 1 - Math.exp(-dt * 20);
+    sun.x = lerp(sun.x, tx, k);
+    sun.y = lerp(sun.y, ty, k);
+    sun.vx = sun.vy = 0;
+  } else {
+    springSunHome(dt);
+  }
+
+  // 重力向量：城市中心 → 太阳
+  let gx = sun.x - PIVOT.x, gy = sun.y - PIVOT.y;
+  const d = Math.hypot(gx, gy) || 1;
+  gx /= d; gy /= d;
+  G.g.x = gx; G.g.y = gy;
+  G.gMag = clamp(d / GRAV_REF, 0.25, 1.2);
+
+  // 城市目标角度：让城市"下方"对准重力方向
+  // 局部向量 (0,1) 经 rotate(θ) 变为 (-sinθ, cosθ)，令其与 g 同向
+  G.thetaT = Math.atan2(-gx, gy);
+  const diff = angDiff(G.thetaT, G.theta);
+  G.thetaV += (diff * 14 - G.thetaV * 5.5) * dt;   // 弹簧 + 阻尼 → 带惯性晃动
+  G.theta += G.thetaV * dt;
+
+  // 失控程度：太阳偏离正下方越远越失控
+  G.severity = clamp(Math.abs(angDiff(G.thetaT, 0)) / 1.35, 0, 1);
+  G.sevSmooth = lerp(G.sevSmooth, G.severity, 1 - Math.exp(-dt * 3));
+
+  // 稳定度：大角度 + 剧烈甩动都会消耗，平缓时缓慢恢复
+  const angStress = clamp(Math.abs(G.thetaV) * 0.9, 0, 5);
+  if (G.severity < 0.16) {
+    G.stability = Math.min(100, G.stability + RECOVER_RATE * dt);
+  } else {
+    G.stability -= (G.severity * DRAIN_RATE + angStress) * dt;
+  }
+  setHud(G.stability);
+
+  // 镜头抖动随混乱度上升
+  G.shake = Math.max(G.shake * Math.exp(-dt * 4),
+    G.sevSmooth * 2.4 + clamp(Math.abs(G.thetaV) * 1.4, 0, 3));
+
+  updateCars(dt);
+  emitWaterfall(dt);
+
+  // 结局判定
+  if (G.stability <= 0) { G.stability = 0; startFall(); }
+  else if (G.time >= ROUND_TIME) startBalance();
+}
+
+function springSunHome(dt) {
+  const sun = G.sun;
+  const ax = (SUN_HOME.x - sun.x) * 26 - sun.vx * 8;
+  const ay = (SUN_HOME.y - sun.y) * 26 - sun.vy * 8;
+  sun.vx += ax * dt; sun.vy += ay * dt;
+  sun.x += sun.vx * dt; sun.y += sun.vy * dt;
+}
+
+// ---------- 车辆 ----------
+function updateCars(dt) {
+  const c = Math.cos(G.theta), s = Math.sin(G.theta);
+  const glx = G.g.x * c + G.g.y * s;   // 重力在街道方向（城市局部 x）的分量
+
+  for (const car of G.world.cars) {
+    if (car.detached) { integrateLooseCar(car, dt, G.g.x, G.g.y); continue; }
+
+    if (G.severity < 0.25) {                 // 平缓时自动巡航
+      car.v += car.dir * 26 * dt;
+      car.v = clamp(car.v, -34, 34);
+    }
+    car.v += glx * 340 * G.gMag * dt;        // 顺坡滑下
+    if (Math.abs(glx) < 0.1) car.v *= Math.exp(-dt * 1.2);
+    car.s += car.v * dt;
+
+    // 到达街道尽头：剧烈倾斜且速度够快 → 被甩出城市；否则轻微弹回
+    if (car.s > 168) {
+      car.s = 168;
+      if (Math.abs(car.v) > 60 && G.severity > 0.55) detachCar(car); else car.v *= -0.35;
+    } else if (car.s < -168) {
+      car.s = -168;
+      if (Math.abs(car.v) > 60 && G.severity > 0.55) detachCar(car); else car.v *= -0.35;
+    }
+  }
+
+  // 简单一维分离，避免车辆完全重叠（V0.1 不做复杂碰撞）
+  const on = G.world.cars.filter(c2 => !c2.detached).sort((a, b) => a.s - b.s);
+  for (let i = 0; i < on.length - 1; i++) {
+    const a = on[i], b = on[i + 1];
+    if (b.s - a.s < 26) {
+      const mid = (a.s + b.s) / 2;
+      a.s = mid - 13; b.s = mid + 13;
+      const av = a.v; a.v = b.v * 0.6; b.v = av * 0.6;
+    }
+  }
+}
+
+function detachCar(car) {
+  car.detached = true;
+  const p = cityToWorld(car.s, -10);
+  car.x = p.x; car.y = p.y;
+  const c = Math.cos(G.theta), s = Math.sin(G.theta);
+  car.vx = c * car.v * 0.6 + G.g.x * 140;   // 街道方向的世界向量 = (cosθ, sinθ)
+  car.vy = s * car.v * 0.6 + G.g.y * 140;
+  car.rot = G.theta;
+  car.rotV = (Math.random() - 0.5) * 4 + car.v * 0.01;
+}
+
+function integrateLooseCar(car, dt, gx, gy) {
+  car.vx += gx * 520 * dt;
+  car.vy += gy * 520 * dt;
+  car.x += car.vx * dt;
+  car.y += car.vy * dt;
+  car.rot += car.rotV * dt;
+}
+
+// ---------- 瀑布粒子 ----------
+const EMITTERS = [{ lx: -166, ly: 6 }, { lx: 166, ly: 6 }, { lx: 0, ly: 78 }];
+
+function emitWaterfall(dt) {
+  const W = G.world;
+  W.emitAcc += dt * 90;
+  while (W.emitAcc >= 1 && W.drops.length < 160) {
+    W.emitAcc -= 1;
+    const e = EMITTERS[(Math.random() * EMITTERS.length) | 0];
+    const p = cityToWorld(e.lx + (Math.random() - 0.5) * 8, e.ly);
+    const sp = 170 + Math.random() * 90;
+    W.drops.push({
+      x: p.x, y: p.y,
+      vx: G.g.x * sp + (Math.random() - 0.5) * 50,
+      vy: G.g.y * sp + (Math.random() - 0.5) * 50,
+      life: 0, maxLife: 1.5 + Math.random() * 1.1, size: 1.4 + Math.random() * 1.8,
+    });
+  }
+}
+
+function updateDrops(dt) {
+  const W = G.world; if (!W) return;
+  // 已有水滴的速度逐渐转向当前重力方向 → 拖动太阳时水流实时变向/倒流
+  const tx = G.g.x * 230 * G.gMag, ty = G.g.y * 230 * G.gMag;
+  const k = 1 - Math.exp(-dt * 2.2);
+  for (let i = W.drops.length - 1; i >= 0; i--) {
+    const d = W.drops[i];
+    d.life += dt;
+    d.vx = lerp(d.vx, tx, k);
+    d.vy = lerp(d.vy, ty, k);
+    d.x += d.vx * dt;
+    d.y += d.vy * dt;
+    if (d.life > d.maxLife || d.x < -60 || d.x > LW + 60 || d.y < -60 || d.y > LH + 60) {
+      W.drops.splice(i, 1);
+    }
+  }
+}
+
+// ---------- 碎片 ----------
+function updateDebris(dt) {
+  const W = G.world; if (!W) return;
+  for (const d of W.debris) {
+    if (G.state === 'play') {
+      // 弹簧挂到城市锚点上（阻尼小 → 摇晃漂浮感），并受重力轻微拖拽
+      const t = cityToWorld(d.lx, d.ly);
+      d.vx += ((t.x - d.x) * 3.2 - d.vx * 2.4) * dt + G.g.x * 26 * dt;
+      d.vy += ((t.y - d.y) * 3.2 - d.vy * 2.4) * dt + G.g.y * 26 * dt;
+    } else if (G.state === 'fall') {
+      d.vy -= 40 * dt;   // 城市下坠时碎片相对上飘
+      d.vx *= Math.exp(-dt * 0.5);
+      d.vy *= Math.exp(-dt * 0.3);
+    }
+    d.x += d.vx * dt;
+    d.y += d.vy * dt;
+    d.rot += d.rotV * dt;
+  }
+}
+
+// ---------- 镜头 ----------
+function updateCamera(dt) {
+  // 镜头只跟随城市角度的 22% → 既保留失控感又不至于晕
+  G.camRot = lerp(G.camRot, G.theta * 0.22, 1 - Math.exp(-dt * 3));
+  if (G.state === 'fall') {
+    G.camY = lerp(G.camY, Math.min(G.cityY * 0.55, 300), 1 - Math.exp(-dt * 2.5));
+  } else {
+    G.camY = lerp(G.camY, 0, 1 - Math.exp(-dt * 2));
+  }
+}
+
+// ---------- 结局：坠落 ----------
+function startFall() {
+  G.state = 'fall';
+  G.fallT = 0;
+  G.cityVy = 40;
+  G.g.x = 0; G.g.y = 1;
+  for (const car of G.world.cars) if (!car.detached) detachCar(car);  // 全部甩出
+  setHud(0);
+}
+
+function updateFall(dt) {
+  G.fallT += dt;
+  G.cityVy += 950 * dt;
+  G.cityY += G.cityVy * dt;
+  G.thetaV += 0.15 * dt;
+  G.theta += G.thetaV * dt;
+  G.shake = Math.max(G.shake, 3);
+  G.sevSmooth = lerp(G.sevSmooth, 0.6, dt);
+  for (const car of G.world.cars) {
+    if (car.detached) integrateLooseCar(car, dt, 0, 1);  // 车掉得比城市慢 → 城市从下方脱离
+  }
+  if (G.fallT > 1.1) G.fade = clamp((G.fallT - 1.1) / 1.4, 0, 1);
+  if (G.fallT > 2.7) showResult('fall');
+}
+
+// ---------- 结局：恢复平衡 ----------
+function startBalance() {
+  G.state = 'balance';
+  G.balT = 0;
+  G.sun.grabbed = false;
+}
+
+function updateBalance(dt) {
+  G.balT += dt;
+  springSunHome(dt);
+  G.g.x = 0; G.g.y = 1;
+  G.thetaT = 0;
+  const diff = angDiff(0, G.theta);
+  G.thetaV += (diff * 10 - G.thetaV * 5) * dt;
+  G.theta += G.thetaV * dt;
+  G.sevSmooth = lerp(G.sevSmooth, 0, 1 - Math.exp(-dt * 2));
+  G.stability = lerp(G.stability, 100, 1 - Math.exp(-dt * 1.5));
+  setHud(G.stability);
+  G.shake *= Math.exp(-dt * 3);
+  for (const car of G.world.cars) {
+    if (car.detached) integrateLooseCar(car, dt, 0, 1);
+  }
+
+  // 金色粒子：城市沐浴在暖光里
+  if (G.balT < 2.6 && Math.random() < dt * 40) {
+    const p = cityToWorld((Math.random() - 0.5) * 360, Math.random() * 80 - 20);
+    G.world.gold.push({
+      x: p.x, y: p.y, vy: -(20 + Math.random() * 30), vx: (Math.random() - 0.5) * 14,
+      life: 0, maxLife: 1.6 + Math.random(), size: 1 + Math.random() * 2,
+    });
+  }
+  // 飞鸟回归
+  if (G.balT > 0.7 && G.world.birds.length < 10 && Math.random() < dt * 3) {
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    G.world.birds.push({
+      x: dir > 0 ? -30 : LW + 30, y: 180 + Math.random() * 260,
+      vx: dir * (60 + Math.random() * 40), ph: Math.random() * TAU,
+    });
+  }
+  if (G.balT > 3.4) showResult('balance');
+}
+
+function updateGold(dt) {
+  const W = G.world; if (!W) return;
+  for (let i = W.gold.length - 1; i >= 0; i--) {
+    const p = W.gold[i];
+    p.life += dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (p.life > p.maxLife) W.gold.splice(i, 1);
+  }
+}
+
+function updateBirds(dt) {
+  const W = G.world; if (!W) return;
+  for (let i = W.birds.length - 1; i >= 0; i--) {
+    const b = W.birds[i];
+    b.x += b.vx * dt;
+    b.ph += dt * 10;
+    if (b.x < -60 || b.x > LW + 60) W.birds.splice(i, 1);
+  }
+}
+
+
+/* ==================== 8. 渲染 ==================== */
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  // --- 调色：失控度 k 让黄昏滑向深空；平衡结局 balK 染成金色 ---
+  const k = clamp(G.sevSmooth * 0.9 + (G.state === 'fall' ? clamp(G.fallT * 0.25, 0, 0.4) : 0), 0, 1);
+  const balK = G.state === 'balance' ? clamp(G.balT / 2, 0, 1)
+             : (G.state === 'result' && G.endKind === 'balance') ? 1 : 0;
+  let top = mixRGB([36, 22, 64], [12, 10, 34], k);
+  let mid = mixRGB([110, 58, 110], [36, 30, 80], k);
+  let hor = mixRGB([255, 154, 90], [64, 44, 96], k);
+  if (balK > 0) {
+    top = mixRGB(top, [58, 42, 94], balK);
+    mid = mixRGB(mid, [150, 90, 110], balK);
+    hor = mixRGB(hor, [255, 210, 138], balK);
+  }
+
+  // --- 天空（铺满全屏，桌面两侧自然延伸） ---
+  const grad = ctx.createLinearGradient(0, 0, 0, ch);
+  grad.addColorStop(0, rgb(top));
+  grad.addColorStop(0.55, rgb(mid));
+  grad.addColorStop(1, rgb(hor));
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, cw, ch);
+
+  // --- 进入 9:16 逻辑舞台 ---
+  ctx.save();
+  ctx.translate(ox, oy);
+  ctx.scale(scale, scale);
+
+  // 星星：失控越深越亮
+  const starA = 0.2 + k * 0.75;
+  for (const st of G.world.stars) {
+    const a = starA * (0.5 + 0.5 * Math.sin(G.t * st.tw + st.ph));
+    ctx.fillStyle = `rgba(255,240,220,${a.toFixed(3)})`;
+    ctx.fillRect(st.x, st.y, st.r, st.r);
+  }
+
+  const ccx = LW / 2, ccy = PIVOT.y + G.camY * 0.4;
+
+  // 云层：只转一半 → 视差
+  ctx.save();
+  ctx.translate(ccx, ccy);
+  ctx.rotate(G.camRot * 0.5);
+  ctx.translate(-ccx, -ccy);
+  drawClouds(balK);
+  ctx.restore();
+
+  // 主世界：完整相机旋转 + 抖动
+  ctx.save();
+  const shx = (Math.random() - 0.5) * G.shake;
+  const shy = (Math.random() - 0.5) * G.shake;
+  ctx.translate(ccx + shx, ccy + shy);
+  ctx.rotate(G.camRot);
+  ctx.translate(-ccx, -ccy);
+  drawDebris();
+  drawCity();
+  drawLooseCars();
+  drawDrops();
+  drawGold();
+  ctx.restore();
+
+  drawBirds();
+
+  // 太阳画在未旋转的屏幕空间：保证始终贴在手指下方
+  drawSun();
+  drawHint();
+
+  // 水印标题（录屏时自带署名）
+  ctx.fillStyle = 'rgba(255,255,255,0.30)';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('重力失控的城市 · V0.1', LW / 2, LH - 14);
+
+  ctx.restore();
+
+  // 暗角
+  const vg = ctx.createRadialGradient(cw / 2, ch * 0.45, ch * 0.3, cw / 2, ch * 0.5, ch * 0.75);
+  vg.addColorStop(0, 'rgba(8,4,18,0)');
+  vg.addColorStop(1, 'rgba(8,4,18,0.42)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, cw, ch);
+
+  // 坠落结局渐黑
+  if (G.fade > 0) {
+    ctx.fillStyle = `rgba(5,3,12,${G.fade})`;
+    ctx.fillRect(0, 0, cw, ch);
+  }
+}
+
+function drawClouds(balK) {
+  for (const c of G.world.clouds) {
+    ctx.fillStyle = balK > 0
+      ? `rgba(255,225,180,${c.a + balK * 0.05})`
+      : `rgba(230,210,235,${c.a})`;
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.scale(c.sc, c.sc * 0.62);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 60, 26, 0, 0, TAU);
+    ctx.ellipse(38, 6, 42, 20, 0, 0, TAU);
+    ctx.ellipse(-42, 8, 38, 18, 0, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawCity() {
+  const W = G.world;
+  ctx.save();
+  ctx.translate(PIVOT.x, PIVOT.y + G.cityY);
+  ctx.rotate(G.theta);
+
+  // 岛底锯齿岩石
+  ctx.fillStyle = '#150d28';
+  ctx.beginPath();
+  ctx.moveTo(-195, 2);
+  for (const r of W.rocks) {
+    ctx.lineTo(r.lx, r.ly + r.depth * 0.4);
+    ctx.lineTo(r.lx + 13, r.ly * 0.5);
+  }
+  ctx.lineTo(195, 2);
+  ctx.closePath();
+  ctx.fill();
+  // 中央大岩锥
+  ctx.fillStyle = '#100a20';
+  ctx.beginPath();
+  ctx.moveTo(-70, 2);
+  ctx.lineTo(0, 130);
+  ctx.lineTo(70, 2);
+  ctx.closePath();
+  ctx.fill();
+
+  // 顶层平台（街道）
+  ctx.fillStyle = '#1d1233';
+  roundRectPath(-196, -8, 392, 12, 4);
+  ctx.fill();
+
+  // 建筑：上下两段，顶端随角速度微微甩动（惯性）
+  for (const b of W.buildings) {
+    const sway = clamp(G.thetaV * 0.02 * b.h, -6, 6);
+    ctx.fillStyle = '#221640';
+    ctx.fillRect(b.x, -8 - b.h * 0.55, b.w, b.h * 0.55);
+    ctx.fillStyle = '#281a4a';
+    ctx.fillRect(b.x + sway * 0.5, -8 - b.h, b.w, b.h * 0.45);
+    if (b.h > 140) ctx.fillRect(b.x + b.w / 2 - 1 + sway, -8 - b.h - 10, 2, 10);  // 天线
+    drawWindows(b, sway);
+  }
+
+  // 街道上的车
+  for (const car of W.cars) if (!car.detached) drawCarLocal(car);
+
+  // 瀑布口
+  ctx.fillStyle = '#2a1c48';
+  for (const e of EMITTERS) ctx.fillRect(e.lx - 7, e.ly - 6, 14, 8);
+
+  ctx.restore();
+}
+
+function drawWindows(b, sway) {
+  const pad = 3;
+  const cw2 = (b.w - pad * 2) / b.cols;
+  const ch2 = (b.h - pad * 2) / b.rows;
+  ctx.fillStyle = 'rgba(255,205,120,0.9)';
+  for (let r = 0; r < b.rows; r++) {
+    const topness = 1 - r / b.rows;
+    for (let c = 0; c < b.cols; c++) {
+      if (!b.lit[r * b.cols + c]) continue;
+      ctx.fillRect(
+        b.x + pad + c * cw2 + cw2 * 0.2 + sway * topness,
+        -8 - b.h + pad + r * ch2 + ch2 * 0.25,
+        cw2 * 0.55, ch2 * 0.5
+      );
+    }
+  }
+}
+
+function drawCarBody() {
+  roundRectPath(-12, -8, 24, 8, 3);
+  ctx.fill();
+  roundRectPath(-7, -13, 14, 6, 3);
+  ctx.fill();
+}
+
+function drawCarLocal(car) {
+  ctx.save();
+  ctx.translate(car.s, -10);
+  ctx.rotate(clamp(car.v * 0.0015, -0.08, 0.08));
+  ctx.fillStyle = rgb(car.color);
+  drawCarBody();
+  ctx.fillStyle = 'rgba(20,12,35,0.85)';
+  ctx.fillRect(-4, -12, 8, 4);
+  ctx.restore();
+}
+
+function drawLooseCars() {
+  for (const car of G.world.cars) {
+    if (!car.detached) continue;
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.rot);
+    ctx.fillStyle = rgb(car.color);
+    drawCarBody();
+    ctx.restore();
+  }
+}
+
+function drawDebris() {
+  ctx.fillStyle = 'rgba(30,20,55,0.9)';
+  for (const d of G.world.debris) {
+    ctx.save();
+    ctx.translate(d.x, d.y);
+    ctx.rotate(d.rot);
+    ctx.beginPath();
+    d.verts.forEach((v, i) => {
+      const px = v[0] * d.size, py = v[1] * d.size;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawDrops() {
+  for (const d of G.world.drops) {
+    const a = clamp(1 - d.life / d.maxLife, 0, 1) * 0.8;
+    ctx.fillStyle = `rgba(170,220,255,${a})`;
+    ctx.fillRect(d.x - d.size / 2, d.y - d.size / 2, d.size, d.size * 1.8);
+  }
+}
+
+function drawGold() {
+  for (const p of G.world.gold) {
+    const a = clamp(1 - p.life / p.maxLife, 0, 1);
+    ctx.fillStyle = `rgba(255,215,130,${a})`;
+    ctx.fillRect(p.x, p.y, p.size, p.size);
+  }
+}
+
+function drawBirds() {
+  ctx.strokeStyle = 'rgba(30,18,45,0.8)';
+  ctx.lineWidth = 2;
+  for (const b of G.world.birds) {
+    const w = 6 + Math.sin(b.ph) * 3;
+    ctx.beginPath();
+    ctx.moveTo(b.x - 8, b.y);
+    ctx.quadraticCurveTo(b.x - 3, b.y - w, b.x, b.y);
+    ctx.quadraticCurveTo(b.x + 3, b.y - w, b.x + 8, b.y);
+    ctx.stroke();
+  }
+}
+
+function drawSun() {
+  const s = G.sun;
+  const pulse = 1 + Math.sin(G.t * 3) * 0.05 + (s.grabbed ? 0.12 : 0);
+  const R = 26 * pulse;
+
+  // 外层光晕
+  const glow = ctx.createRadialGradient(s.x, s.y, 4, s.x, s.y, 110);
+  glow.addColorStop(0, 'rgba(255,220,140,0.85)');
+  glow.addColorStop(0.25, 'rgba(255,180,90,0.35)');
+  glow.addColorStop(1, 'rgba(255,160,80,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, 110, 0, TAU);
+  ctx.fill();
+
+  // 太阳本体
+  const core = ctx.createRadialGradient(s.x - 6, s.y - 8, 2, s.x, s.y, R);
+  core.addColorStop(0, '#fff6d8');
+  core.addColorStop(0.6, '#ffcf6e');
+  core.addColorStop(1, '#ff9040');
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, R, 0, TAU);
+  ctx.fill();
+
+  if (s.grabbed) {
+    // 抓取环
+    ctx.strokeStyle = 'rgba(255,240,200,0.8)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, R + 9 + Math.sin(G.t * 8) * 2, 0, TAU);
+    ctx.stroke();
+    // 重力方向虚线箭头（学习反馈）
+    const dx = s.x - PIVOT.x, dy = s.y - PIVOT.y;
+    const d = Math.hypot(dx, dy) || 1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.moveTo(PIVOT.x, PIVOT.y);
+    ctx.lineTo(PIVOT.x + (dx / d) * Math.min(d, 120), PIVOT.y + (dy / d) * Math.min(d, 120));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+// 新手引导：幽灵手绕太阳画弧，首次拖动或约 7 秒后消失
+function drawHint() {
+  if (G.hasInteracted || G.state !== 'play') return;
+  const a = clamp(1.2 - G.t / 6, 0, 1);
+  if (a <= 0) return;
+  const t = G.t % 2.4;
+  const ang = -Math.PI / 2 + Math.sin((t / 2.4) * TAU) * 1.1;
+  const hx = G.sun.x + Math.cos(ang) * 54;
+  const hy = G.sun.y + Math.sin(ang) * 54;
+  ctx.globalAlpha = a * 0.85;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(hx, hy, 10, 0, TAU);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(G.sun.x, G.sun.y, 54, -Math.PI / 2 - 1.1, -Math.PI / 2 + 1.1);
+  ctx.stroke();
+  ctx.globalAlpha = a;
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = '15px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('拖动太阳 · 改变重力', G.sun.x, G.sun.y - 92);
+  ctx.globalAlpha = 1;
+}
+
+/* ==================== 9. HUD 与流程 ==================== */
+const hudEl = document.getElementById('hud');
+const stabFill = document.getElementById('stabFill');
+const hudText = document.getElementById('hudText');
+let lastHud = -1;
+
+function setHud(v) {
+  if (Math.abs(v - lastHud) < 0.4) return;   // 减少 DOM 写入
+  lastHud = v;
+  stabFill.style.width = clamp(v, 0, 100) + '%';
+  const hue = lerp(8, 130, clamp(v, 0, 100) / 100);   // 红 → 绿
+  stabFill.style.background = `linear-gradient(90deg, hsl(${hue},85%,58%), hsl(${hue + 18},85%,64%))`;
+  hudEl.classList.toggle('low', v < 25);
+}
+
+function updateHudText() {
+  if (G.state === 'play') {
+    hudText.textContent = `稳定度 · 再撑 ${Math.max(0, ROUND_TIME - G.time).toFixed(1)}s`;
+  } else if (G.state === 'balance') {
+    hudText.textContent = '重力恢复中…';
+  } else if (G.state === 'fall') {
+    hudText.textContent = '稳定度归零';
+  }
+}
+
+function showResult(kind) {
+  G.state = 'result';
+  G.endKind = kind;
+  document.getElementById('endTitle').textContent = kind === 'fall' ? '它坠入了云海' : '城市得救了';
+  document.getElementById('endSub').textContent = kind === 'fall'
+    ? '稳定度归零 —— 城市没能撑过这个夜晚'
+    : '你稳住了重力，黎明照常升起';
+  document.getElementById('overlay').classList.add('show');
+}
+
+function resetGame() {
+  const seed = (Math.random() * 1e9) | 0;
+  G = freshState(seed);
+  G.world = buildWorld(seed);
+  lastHud = -1;
+  setHud(100);
+  document.getElementById('overlay').classList.remove('show');
+}
+
+/* ==================== 10. Debug 与主循环 ==================== */
+const debugPanel = document.getElementById('debug');
+const debugInfo = document.getElementById('debugInfo');
+if (new URLSearchParams(location.search).has('debug')) debugPanel.style.display = 'block';
+
+function dbgForceFall() { if (G.state === 'play') G.stability = 0; }
+function dbgForceWin() { if (G.state === 'play') G.time = ROUND_TIME; }
+document.getElementById('dbgFall').onclick = dbgForceFall;
+document.getElementById('dbgWin').onclick = dbgForceWin;
+document.getElementById('dbgReset').onclick = () => resetGame();
+document.getElementById('restartBtn').onclick = () => resetGame();
+
+window.addEventListener('keydown', e => {
+  const k2 = e.key.toLowerCase();
+  if (k2 === 'd') debugPanel.style.display = debugPanel.style.display === 'none' ? 'block' : 'none';
+  else if (k2 === 'f') dbgForceFall();
+  else if (k2 === 'b') dbgForceWin();
+  else if (k2 === 'r') resetGame();
+});
+
+function updateDebugInfo(fps) {
+  if (debugPanel.style.display !== 'block') return;
+  debugInfo.textContent =
+    `state:${G.state}\nt:${G.time.toFixed(1)} 稳定:${G.stability.toFixed(0)}\n` +
+    `θ:${(G.theta * 57.3).toFixed(0)}° fps:${fps.toFixed(0)}`;
+}
+
+let last = performance.now();
+let fps = 60;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  dt = Math.min(dt, 0.05);              // 切后台回来不跳变
+  fps = lerp(fps, 1 / Math.max(dt, 1e-4), 0.05);
+  update(dt);
+  render();
+  updateHudText();
+  updateDebugInfo(fps);
+  requestAnimationFrame(frame);
+}
+
+/* ==================== 启动 ==================== */
+resize();
+resetGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

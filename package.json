@@ -1,0 +1,10 @@
+{
+  "name": "gravity-out-of-control-city",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "重力失控的城市 V0.1 —— 单文件 Canvas 2D 小游戏；dev 脚本仅用于本地预览，游戏本体零依赖。",
+  "scripts": {
+    "dev": "node server.mjs"
+  }
+}
